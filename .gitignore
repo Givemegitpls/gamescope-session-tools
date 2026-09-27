@@ -1,0 +1,23 @@
+# makepkg (Arch packaging) — do NOT run makepkg in the repo root
+/pkg/
+.SRCINFO
+/gamescope-session-tools/
+*.pkg.tar
+*.pkg.tar.*
+
+# python
+__pycache__/
+*.py[cod]
+
+# ruff
+.ruff_cache/
+
+# editors / OS
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store
+
+# local logs
+*.log

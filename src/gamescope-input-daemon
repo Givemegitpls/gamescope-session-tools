@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Gamescope Input Daemon — volume and power button handling for gamescope sessions.
+
+Reads evdev input devices and reacts to the volume keys (via wpctl) and the
+power button (forwarded to Steam). The daemon is inert until told which session
+is active over its control socket:
+
+    gamescope   grab the power button, handle volume/power keys
+    desktop     release all devices, do not interfere with the compositor
+    status      report the current mode
+    stop        shut the daemon down
+
+At startup the daemon does NOT grab anything. It waits for a command, so a
+compositor running on the desktop keeps its own key bindings (e.g. the
+XF86PowerOff binding) until a gamescope session is actually active.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import errno
+import os
+import signal
+import sys
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final, cast, final
+
+import evdev
+
+DOUBLE_PRESS_SECONDS: Final[float] = 0.6
+POWER_BUTTON_PHYS: Final[tuple[str, ...]] = (
+    "LNXPWRBN/button/input0",
+    "PNP0C0C/button/input0",
+)
+STEAM_URL_MENU: Final[str] = "steam://longpowerpress"
+STEAM_URL_SLEEP: Final[str] = "steam://shortpowerpress"
+DEFAULT_SOCKET: Final[Path] = Path(
+    "/run/gamescope-input-daemon/gamescope-input-daemon.sock"
+)
+
+MODE_GAMESCOPE: Final[str] = "gamescope"
+MODE_DESKTOP: Final[str] = "desktop"
+
+
+def _set_pdeathsig(sig: int) -> None:
+    """Ask the kernel to deliver a signal when the parent dies."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _: int = libc.prctl(1, sig)  # pyright: ignore[reportAny] — PR_SET_PDEATHSIG = 1
+    except OSError:
+        pass
+
+
+@dataclass
+class _PowerButton:
+    device: evdev.InputDevice[str]
+
+
+@final
+class InputDaemon:
+    def __init__(self, socket_path: Path) -> None:
+        self._socket_path = socket_path
+        self._devices: list[evdev.InputDevice[str]] = []
+        self._grabbed: list[evdev.InputDevice[str]] = []
+        self._read_tasks: list[asyncio.Task[None]] = []
+        self._shutdown_event = asyncio.Event()
+        self._server: asyncio.AbstractServer | None = None
+        self._pending_single_task: asyncio.Task[None] | None = None
+        self._last_press_time: float = 0.0
+        self._press_count: int = 0
+        self._mode: str = MODE_DESKTOP
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------ setup
+
+    async def start(self) -> None:
+        _set_pdeathsig(signal.SIGTERM)
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self._shutdown)
+
+        self._open_devices()
+
+        await self._unlink_socket()
+        self._server = await asyncio.start_unix_server(
+            self._handle_client, path=str(self._socket_path)
+        )
+        _ = self._socket_path.chmod(0o600)
+
+        try:
+            async with self._server:
+                _ = await self._shutdown_event.wait()
+        finally:
+            await self._cleanup()
+
+    def _open_devices(self) -> None:
+        """Open every device once; grabbing happens only in gamescope mode."""
+        paths: list[str] = evdev.list_devices()  # pyright: ignore[reportUnknownMemberType]
+        for path in paths:
+            try:
+                device: evdev.InputDevice[str] = evdev.InputDevice(path)
+            except (OSError, PermissionError) as e:
+                _ = sys.stderr.write(f"cannot open {path}: {e}\n")
+                continue
+            self._devices.append(device)
+            self._read_tasks.append(asyncio.create_task(self._read_device(device)))
+
+        if not self._devices:
+            _ = sys.stderr.write(
+                "No input devices could be opened. Is the daemon running with "
+                + "access to /dev/input (SupplementaryGroups=input)?\n"
+            )
+
+    async def _unlink_socket(self) -> None:
+        try:
+            self._socket_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            _ = sys.stderr.write(f"cannot remove stale socket: {e}\n")
+
+    # ----------------------------------------------------------- control API
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            raw = (await reader.read(1024)).decode(errors="replace").strip()
+        except OSError:
+            writer.close()
+            return
+
+        response = "error: no response"
+        try:
+            response = await self._dispatch_command(raw)
+        except Exception as e:  # noqa: BLE001 — never let a bad command kill us
+            response = f"error: {e}"
+        finally:
+            try:
+                writer.write((response + "\n").encode())
+                await writer.drain()
+            except OSError:
+                pass
+            writer.close()
+
+    async def _dispatch_command(self, command: str) -> str:
+        async with self._lock:
+            if command == MODE_GAMESCOPE:
+                await self._set_mode(MODE_GAMESCOPE)
+                return MODE_GAMESCOPE
+            if command == MODE_DESKTOP:
+                await self._set_mode(MODE_DESKTOP)
+                return MODE_DESKTOP
+            if command == "status":
+                return self._mode
+            if command == "stop":
+                self._shutdown()
+                return "stopping"
+            return f"error: unknown command {command!r}"
+
+    async def _set_mode(self, mode: str) -> None:
+        if mode == self._mode:
+            return
+        if mode == MODE_GAMESCOPE:
+            self._grab_power_button()
+            self._mode = MODE_GAMESCOPE
+        else:
+            self._ungrab_all()
+            self._reset_press_state()
+            self._mode = MODE_DESKTOP
+
+    def _grab_power_button(self) -> None:
+        for device in self._devices:
+            if self._is_power_button(device):
+                try:
+                    device.grab()
+                except OSError as e:
+                    _ = sys.stderr.write(f"cannot grab {device.path}: {e}\n")
+                    continue
+                self._grabbed.append(device)
+
+    def _ungrab_all(self) -> None:
+        for device in self._grabbed:
+            try:
+                device.ungrab()
+            except OSError:
+                pass
+        self._grabbed.clear()
+
+    def _reset_press_state(self) -> None:
+        if self._pending_single_task is not None:
+            if not self._pending_single_task.done():
+                _ = self._pending_single_task.cancel()
+            self._pending_single_task = None
+        self._press_count = 0
+        self._last_press_time = 0.0
+
+    # ------------------------------------------------------------- lifecycle
+
+    def _shutdown(self) -> None:
+        self._shutdown_event.set()
+
+    async def _cleanup(self) -> None:
+        self._reset_press_state()
+        if self._server is not None:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except OSError:
+                pass
+
+        self._ungrab_all()
+
+        for task in self._read_tasks:
+            if not task.done():
+                _ = task.cancel()
+        for task in self._read_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._read_tasks.clear()
+
+        for device in self._devices:
+            try:
+                device.close()
+            except OSError:
+                pass
+        self._devices.clear()
+
+        try:
+            self._socket_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    # ----------------------------------------------------------- event loop
+
+    async def _read_device(self, device: evdev.InputDevice[str]) -> None:
+        try:
+            events: AsyncIterator[evdev.InputEvent] = cast(
+                "AsyncIterator[evdev.InputEvent]",
+                device.async_read_loop(),  # pyright: ignore[reportUnknownMemberType]
+            )
+            async for event in events:
+                if self._mode != MODE_GAMESCOPE:
+                    continue
+                if event.type != evdev.ecodes.EV_KEY:
+                    continue
+                if event.code == evdev.ecodes.KEY_POWER:
+                    if event.value == 1:
+                        self._on_power_press()
+                    continue
+                if event.value == 1:
+                    if event.code == evdev.ecodes.KEY_VOLUMEUP:
+                        await self._set_volume("5%+")
+                    elif event.code == evdev.ecodes.KEY_VOLUMEDOWN:
+                        await self._set_volume("5%-")
+                    elif event.code == evdev.ecodes.KEY_MUTE:
+                        await self._toggle_mute()
+        except asyncio.CancelledError:
+            raise
+        except OSError as e:
+            if e.errno != errno.ENODEV:
+                _ = sys.stderr.write(f"evdev error on {device.path}: {e}\n")
+        except Exception as e:  # noqa: BLE001 — last-resort guard for evdev reads
+            _ = sys.stderr.write(f"unexpected error on {device.path}: {e}\n")
+
+    @staticmethod
+    def _is_power_button(device: evdev.InputDevice[str]) -> bool:
+        if device.name != "Power Button":
+            return False
+        return device.phys in POWER_BUTTON_PHYS
+
+    def _on_power_press(self) -> None:
+        now = asyncio.get_running_loop().time()
+        if now - self._last_press_time <= DOUBLE_PRESS_SECONDS:
+            self._press_count += 1
+        else:
+            self._press_count = 1
+        self._last_press_time = now
+        self._reset_pending_task()
+        if self._press_count >= 2:
+            self._press_count = 0
+            self._last_press_time = 0.0
+            self._pending_single_task = asyncio.create_task(
+                self._run_steam_command(STEAM_URL_SLEEP)
+            )
+            return
+        self._pending_single_task = asyncio.create_task(self._single_press_timer())
+
+    def _reset_pending_task(self) -> None:
+        if self._pending_single_task is not None:
+            if not self._pending_single_task.done():
+                _ = self._pending_single_task.cancel()
+            self._pending_single_task = None
+
+    async def _single_press_timer(self) -> None:
+        try:
+            await asyncio.sleep(DOUBLE_PRESS_SECONDS)
+        except asyncio.CancelledError:
+            return
+        self._pending_single_task = None
+        self._press_count = 0
+        await self._run_steam_command(STEAM_URL_MENU)
+
+    # -------------------------------------------------------------- actions
+
+    async def _run_steam_command(self, url: str) -> None:
+        steam = Path.home() / ".local/share/Steam/ubuntu12_32/steam"
+        if not steam.exists():
+            _ = sys.stderr.write(f"steam binary not found: {steam}\n")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                steam,
+                "-ifrunning",
+                url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            _ = await proc.wait()
+        except OSError as e:
+            _ = sys.stderr.write(f"failed to run steam command {url}: {e}\n")
+
+    async def _set_volume(self, delta: str) -> None:
+        limit = "1.0" if delta.endswith("+") else "0.0"
+        await self._run_wpctl("set-volume", "@DEFAULT_AUDIO_SINK@", delta, "-l", limit)
+
+    async def _toggle_mute(self) -> None:
+        await self._run_wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "toggle")
+
+    @staticmethod
+    async def _run_wpctl(*args: str) -> None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "wpctl",
+                *args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            returncode = await proc.wait()
+        except OSError as e:
+            _ = sys.stderr.write(f"failed to run wpctl {args}: {e}\n")
+            return
+        if returncode != 0:
+            _ = sys.stderr.write(f"wpctl {args} exited with {returncode}\n")
+
+
+def _resolve_socket() -> Path:
+    """Priority: --socket PATH > $GAMESCOPE_INPUT_DAEMON_SOCKET > default."""
+    argv = sys.argv[1:]
+    if argv:
+        if len(argv) == 2 and argv[0] == "--socket":
+            return Path(argv[1])
+        _ = sys.stderr.write(f"usage: {sys.argv[0]} [--socket PATH]\n")
+        sys.exit(2)
+    env = os.environ.get("GAMESCOPE_INPUT_DAEMON_SOCKET")
+    return Path(env) if env else DEFAULT_SOCKET
+
+
+async def _main() -> None:
+    daemon = InputDaemon(_resolve_socket())
+    await daemon.start()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass

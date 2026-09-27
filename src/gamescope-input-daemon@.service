@@ -1,0 +1,17 @@
+[Unit]
+Description=Gamescope input daemon for %i (power button and volume keys)
+Documentation=file:///usr/share/doc/gamescope-session-tools/README.md
+After=multi-user.target
+
+[Service]
+Type=simple
+User=%i
+SupplementaryGroups=input
+RuntimeDirectory=gamescope-input-daemon/%i
+RuntimeDirectoryMode=0755
+ExecStart=/bin/sh -c 'XDG_RUNTIME_DIR=/run/user/$(id -u %i) exec /usr/bin/gamescope-input-daemon --socket /run/gamescope-input-daemon/%i/gamescope-input-daemon.sock'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

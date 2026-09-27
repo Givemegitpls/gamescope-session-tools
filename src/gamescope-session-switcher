@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Gamescope session switcher.
+
+Owns the transition between the desktop Wayland session and the gamescope
+session. It starts and stops the game session itself and, on every transition,
+tells gamescope-input-daemon which session is active, so the daemon only grabs
+the power button while gamescope runs.
+
+Control socket: /tmp/gamescope-session-switcher.sock
+Commands:       gamescope | desktop | status | stop
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final, final
+
+SERVICE_NAME: Final[str] = "gamescope-session-switcher"
+SOCKET_PATH: Final[Path] = Path(f"/tmp/{SERVICE_NAME}.sock")
+_USER: Final[str] = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+INPUT_DAEMON_SOCKET: Final[Path] = Path(
+    os.environ.get(
+        "GAMESCOPE_INPUT_DAEMON_SOCKET",
+        f"/run/gamescope-input-daemon/{_USER}/gamescope-input-daemon.sock",
+    )
+)
+READ_TIMEOUT: Final[float] = 2.0
+DEFAULT_LOG_FILE: Final[Path] = Path(f"/tmp/{SERVICE_NAME}.log")
+
+_log_file: Path = DEFAULT_LOG_FILE
+
+
+def _open_log() -> None:
+    """Create or truncate the log file with restrictive permissions."""
+    try:
+        with open(_log_file, "w"):
+            pass
+        _log_file.chmod(0o600)
+    except OSError as e:
+        _ = sys.stderr.write(f"cannot open log file {_log_file}: {e}\n")
+
+
+@dataclass(frozen=True)
+class Session:
+    start_command: str
+    stop_command: str
+    input_mode: str
+
+
+class Gamescope(Session):
+    start_command: str = (
+        "gamescope_drm_allow_dynamic_modes_for_external_display=1 "
+        "gamescope --mangoapp -e -- steam -steamdeck -steamos3"
+    )
+    stop_command: str = "steam -shutdown"
+    input_mode: str = "gamescope"
+
+
+class Desktop(Session):
+    start_command: str = "uwsm start default"
+    stop_command: str = "uwsm stop"
+    input_mode: str = "desktop"
+
+
+SESSIONS: Final[dict[str, type[Session]]] = {
+    "gamescope": Gamescope,
+    "desktop": Desktop,
+}
+
+
+def log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{timestamp} {message}\n"
+    try:
+        with open(_log_file, "a") as f:
+            _ = f.write(line)
+    except OSError:
+        _ = sys.stderr.write(line)
+        _ = sys.stderr.flush()
+
+
+@final
+class Daemon:
+    def __init__(self) -> None:
+        self.current_session: str | None = None
+        self.process: asyncio.subprocess.Process | None = None
+        self._server: asyncio.AbstractServer | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
+
+    # ------------------------------------------------------------- lifecycle
+
+    async def start(self) -> None:
+        try:
+            SOCKET_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            await asyncio.to_thread(self._rename_process)
+        except OSError:
+            pass
+
+        self._server = await asyncio.start_unix_server(
+            self._handle_client, path=str(SOCKET_PATH)
+        )
+        _ = SOCKET_PATH.chmod(0o600)
+
+        await self.switch_to("desktop")
+        try:
+            async with self._server:
+                await self._server.serve_forever()
+        finally:
+            await self.stop_current()
+
+    @staticmethod
+    def _rename_process() -> None:
+        with open("/proc/self/comm", "w") as f:
+            _ = f.write(SERVICE_NAME)
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            data = (await reader.read(1024)).decode(errors="replace").strip()
+        except OSError:
+            writer.close()
+            return
+
+        response = "error: no response"
+        try:
+            response = await self._dispatch(data)
+        except Exception as e:  # noqa: BLE001 — never let a bad command kill us
+            response = f"error: {e}"
+        finally:
+            try:
+                writer.write(response.encode())
+                await writer.drain()
+            except OSError:
+                pass
+            writer.close()
+
+    async def _dispatch(self, command: str) -> str:
+        if command in SESSIONS:
+            await self.switch_to(command)
+            return self.current_session or "none"
+        if command == "status":
+            return self.current_session or "none"
+        if command == "stop":
+            await self.stop_current()
+            if self._server is not None:
+                self._server.close()
+            return "stopping"
+        return f"error: unknown command {command!r}"
+
+    # --------------------------------------------------------------- session
+
+    async def switch_to(self, name: str) -> None:
+        if name == self.current_session:
+            return
+        log(f"switching {self.current_session or 'none'} -> {name}")
+        await self.stop_current()
+        session = SESSIONS[name]
+        self.process = await asyncio.create_subprocess_shell(
+            session.start_command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.current_session = name
+        self._monitor_task = asyncio.create_task(self._monitor_process())
+        await self._set_input_mode(session.input_mode)
+        log(f"session {name} started (pid {self.process.pid})")
+
+    async def _set_input_mode(self, mode: str) -> None:
+        try:
+            reader, writer = await asyncio.open_unix_connection(
+                str(INPUT_DAEMON_SOCKET)
+            )
+            writer.write(mode.encode())
+            await writer.drain()
+            _ = await asyncio.wait_for(reader.read(1024), timeout=READ_TIMEOUT)
+            writer.close()
+        except (FileNotFoundError, ConnectionRefusedError):
+            log(
+                f"gamescope-input-daemon is not running ({INPUT_DAEMON_SOCKET}); "
+                + "input mode left unchanged"
+            )
+        except (OSError, asyncio.TimeoutError) as e:
+            log(f"failed to set input mode {mode!r}: {e}")
+        else:
+            log(f"input mode set to {mode!r}")
+
+    async def _monitor_process(self) -> None:
+        assert self.process is not None
+        try:
+            _ = await self.process.wait()
+        except asyncio.CancelledError:
+            return
+        log(f"session {self.current_session} exited with {self.process.returncode}")
+        if self._server is not None:
+            self._server.close()
+
+    async def stop_current(self) -> None:
+        if self.current_session is None:
+            return
+        session = SESSIONS[self.current_session]
+        log(f"stopping session {self.current_session}")
+
+        if self._monitor_task is not None:
+            _ = self._monitor_task.cancel()
+            self._monitor_task = None
+
+        try:
+            _ = await asyncio.create_subprocess_shell(
+                session.stop_command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            log(f"error running stop command: {e}")
+
+        if self.process is not None and self.process.returncode is None:
+            self.process.terminate()
+            try:
+                _ = await asyncio.wait_for(self.process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self.process.kill()
+                _ = await self.process.wait()
+
+        self.current_session = None
+        self.process = None
+
+
+async def send_command(command: str) -> None:
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(SOCKET_PATH))
+    except (FileNotFoundError, ConnectionRefusedError):
+        log("switcher daemon is not running")
+        sys.exit(1)
+    try:
+        writer.write(command.encode())
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(1024), timeout=READ_TIMEOUT)
+        _ = sys.stdout.write(response.decode() + "\n")
+    except (OSError, asyncio.TimeoutError) as e:
+        log(f"command failed: {e}")
+        sys.exit(1)
+    finally:
+        writer.close()
+
+
+COMMANDS: Final[tuple[str, ...]] = (*SESSIONS, "status", "stop")
+
+
+def _parse_log_file(argv: list[str]) -> list[str]:
+    """Extract --log-file PATH from argv, returning the remaining arguments."""
+    global _log_file
+    if len(argv) >= 2 and argv[0] == "--log-file":
+        _log_file = Path(argv[1])
+        return argv[2:]
+    return argv
+
+
+def main() -> None:
+    argv = _parse_log_file(sys.argv[1:])
+    if argv:
+        command = argv[0]
+        if len(argv) > 1 or command not in COMMANDS:
+            _ = sys.stderr.write(
+                f"usage: {sys.argv[0]} [--log-file PATH] [{'|'.join(COMMANDS)}]\n"
+            )
+            sys.exit(2)
+        asyncio.run(send_command(command))
+        return
+
+    _open_log()
+    log(f"starting {SERVICE_NAME}")
+    if (
+        subprocess.run(
+            ["pgrep", "-x", SERVICE_NAME], capture_output=True, check=False
+        ).returncode
+        == 0
+    ):
+        _ = sys.stderr.write("switcher daemon is already running\n")
+        sys.exit(1)
+    asyncio.run(Daemon().start())
+
+
+if __name__ == "__main__":
+    main()
