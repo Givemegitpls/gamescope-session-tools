@@ -4,6 +4,12 @@ Gamescope session integration for machines that are **not** Steam Decks: a
 media/power-button daemon, a session switcher, and the SteamOS stubs Steam
 expects inside a gamescope session.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Packaged for Arch Linux; the recipe (`PKGBUILD`, `arch=any`) installs the
+scripts from `src/` into `/usr/bin` and a systemd unit into
+`/usr/lib/systemd/system`.
+
 ## Why this exists
 
 On a regular distribution running Steam's Game Mode (gamescope), two things are
@@ -16,8 +22,8 @@ broken out of the box:
 
 gamescope itself intercepts `XF86AudioLowerVolume`/`XF86AudioRaiseVolume`/
 `XF86PowerOff` and sends them *only* to Steam's overlay
-(`src/wlserver.cpp`, "forbidden_key"). Steam shows the volume OSD but never
-applies the change on a non-Deck machine, so the keys appear dead.
+(gamescope upstream `src/wlserver.cpp`, "forbidden_key"). Steam shows the volume
+OSD but never applies the change on a non-Deck machine, so the keys appear dead.
 
 There is no way around reading the physical devices: `libei` cannot be used
 because gamescope is an **Ei server** (it accepts injected input and never
@@ -39,12 +45,13 @@ emits key events), and `/dev/input/event*` is `root:input 0660` with no
 ## Repository layout
 
 ```
-PKGBUILD      Arch package recipe (pulls this repo as a git source)
-LICENSE       MIT
-README.md     this file
-src/          scripts and the systemd unit installed by the package
+PKGBUILD       Arch package recipe (pulls this repo as a git source)
+LICENSE        MIT
+README.md      this file
+.gitignore     build artifacts, editor files
+src/           scripts and the systemd unit installed by the package
+.opencode/     agent notes for this repository
 ```
-
 
 ## Requirements
 
@@ -57,14 +64,34 @@ src/          scripts and the systemd unit installed by the package
 
 ## Install
 
-The PKGBUILD pulls this repository as a `git+https` source, so `makepkg` needs
-the changes pushed. Do **not** run `makepkg` in the repository root — build in a
-scratch directory so makepkg does not clone into the source tree:
+The PKGBUILD pulls this repository as a `git+https` source, so `makepkg` builds
+the **pushed** state: local uncommitted edits are not picked up. Do **not** run
+`makepkg` in the repository root — build in a scratch directory so makepkg does
+not clone into the source tree:
 
 ```sh
-mkdir /tmp/gst && cp PKGBUILD /tmp/gst/ && cd /tmp/gst
+mkdir -p /tmp/gst && cp PKGBUILD /tmp/gst/ && cd /tmp/gst
 makepkg -f
 sudo pacman -U gamescope-session-tools-*.pkg.tar.zst
+```
+
+Alternatively, clone the repository and copy the PKGBUILD out of it:
+
+```sh
+git clone https://github.com/Givemegitpls/gamescope-session-tools.git
+cd gamescope-session-tools
+mkdir -p /tmp/gst && cp PKGBUILD /tmp/gst/ && cd /tmp/gst
+makepkg -f && sudo pacman -U gamescope-session-tools-*.pkg.tar.zst
+```
+
+### Updating
+
+Bump `pkgver`/`pkgrel` in `PKGBUILD`, push, then rebuild:
+
+```sh
+makepkg -f                     # in the scratch directory, after refreshing PKGBUILD
+sudo pacman -U gamescope-session-tools-*.pkg.tar.zst
+sudo systemctl restart gamescope-input-daemon@$USER.service   # if the daemon is running
 ```
 
 ### Enable the daemon (once per user)
@@ -182,15 +209,15 @@ switcher dies, the power button is never left captured on the desktop.
 Facts collected while implementing this, in case the setup has to be
 revisited:
 
-- **gamescope swallows the media keys.** `src/wlserver.cpp` treats
-  `XF86AudioLowerVolume`, `XF86AudioRaiseVolume` and `XF86PowerOff` as
+- **gamescope swallows the media keys.** gamescope upstream `src/wlserver.cpp`
+  treats `XF86AudioLowerVolume`, `XF86AudioRaiseVolume` and `XF86PowerOff` as
   `forbidden_key` and routes them to Steam's overlay only. Nothing outside
   gamescope can observe them, hence the evdev daemon.
 - **libei is not an option.** gamescope embeds an **Ei server** (`eis_*`):
-  `src/InputEmulation.cpp` handles `EIS_EVENT_KEYBOARD_KEY` and calls
-  `wlserver_key()`. It accepts injected input and never emits key events, so a
-  separate process cannot subscribe to it. `libei.so` exports no `eis_*`
-  symbols at all.
+  gamescope upstream `src/InputEmulation.cpp` handles `EIS_EVENT_KEYBOARD_KEY`
+  and calls `wlserver_key()`. It accepts injected input and never emits key
+  events, so a separate process cannot subscribe to it. `libei.so` exports no
+  `eis_*` symbols at all.
 - **libseat is not an option either.** The unit is owned by the compositor:
   opening a second seat from another process fails with
   `EBUSY / Device or resource busy` (the `logind` backend permits one
