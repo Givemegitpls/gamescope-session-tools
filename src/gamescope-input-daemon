@@ -8,32 +8,49 @@ is active over its control socket:
     gamescope   grab the power button, handle volume/power keys
     desktop     release all devices, do not interfere with the compositor
     status      report the current mode
-    rescan      re-open devices that appeared after startup
+    rescan      re-read /dev/input and open every readable device
     stop        shut the daemon down
 
 At startup the daemon does NOT grab anything. It waits for a command, so a
 compositor running on the desktop keeps its own key bindings (e.g. the
 XF86PowerOff binding) until a gamescope session is actually active.
+
+A background watcher keeps the open device set in sync with the kernel: it
+subscribes to udev and reconciles on every add/remove/change event, which is
+what makes hot-plug and suspend/resume work. Devices are matched by identity
+(name/phys/uniq), not by their ``eventN`` node, because those numbers change
+when a device is re-registered. Without pyudev the watcher falls back to
+polling /dev/input.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import errno
 import os
 import re
 import signal
 import sys
+from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Final, cast, final
+from typing import Final, Protocol, cast, final
 
 import evdev
 
+try:
+    import pyudev  # pyright: ignore[reportMissingImports]
+except ImportError:  # pragma: no cover — declared as a package dependency
+    pyudev = None
+
 DOUBLE_PRESS_SECONDS: Final[float] = 0.6
-RESCAN_DELAY_SECONDS: Final[float] = 1.0
+UDEV_DEBOUNCE_SECONDS: Final[float] = 0.3
+POLL_INTERVAL_SECONDS: Final[float] = 2.0
+SAFETY_INTERVAL_SECONDS: Final[float] = 30.0
 POWER_BUTTON_PHYS: Final[tuple[str, ...]] = (
     "LNXPWRBN/button/input0",
     "PNP0C0C/button/input0",
@@ -43,6 +60,8 @@ STEAM_URL_SLEEP: Final[str] = "steam://shortpowerpress"
 DEFAULT_SOCKET: Final[Path] = Path(
     "/run/gamescope-input-daemon/gamescope-input-daemon.sock"
 )
+INPUT_DIR: Final[Path] = Path("/dev/input")
+PROCDEV_PATH: Final[Path] = Path("/proc/bus/input/devices")
 
 MODE_GAMESCOPE: Final[str] = "gamescope"
 MODE_DESKTOP: Final[str] = "desktop"
@@ -69,71 +88,33 @@ def _is_readable(path: str) -> bool:
 def _open_device(path: str) -> evdev.InputDevice[str]:
     """Open a device read-only.
 
-    ``evdev.InputDevice`` takes either a path or a file descriptor, but when
-    given a descriptor it re-opens with ``O_RDWR`` — which fails for a
-    non-owner in the ``input`` group.  Pass the path and let evdev fall back
-    to ``O_RDONLY`` on ``EACCES`` (that fallback is in ``evdev/device.py``).
+    ``evdev.InputDevice`` accepts a path or a file descriptor; given a
+    descriptor it re-opens with ``O_RDWR``, which fails for a process that is
+    in the ``input`` group but is not root. Passing the path lets evdev fall
+    back to ``O_RDONLY`` on ``EACCES``.
     """
     return evdev.InputDevice(path)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
 
 @dataclass(frozen=True)
 class _DeviceInfo:
+    """What identifies a device, independently of its /dev node."""
+
     path: str
     name: str
     phys: str
+    uniq: str
+
+
+def _fingerprint(info: _DeviceInfo) -> tuple[str, str, str]:
+    return (info.name, info.phys, info.uniq)
 
 
 _PROCDEV_NAME_RE: Final[re.Pattern[str]] = re.compile(r'^N: Name="(.*)"$')
 _PROCDEV_PHYS_RE: Final[re.Pattern[str]] = re.compile(r"^P: Phys=(.*)$")
+_PROCDEV_UNIQ_RE: Final[re.Pattern[str]] = re.compile(r"^U: Uniq=(.*)$")
 _PROCDEV_HANDLERS_RE: Final[re.Pattern[str]] = re.compile(r"^H: Handlers=(.*)$")
 _EVENT_NODE_RE: Final[re.Pattern[str]] = re.compile(r"\bevent\d+\b")
-
-
-def _readable_input_devices() -> list[_DeviceInfo]:
-    """List readable /dev/input/event* nodes with names from /proc.
-
-    Unlike ``evdev.list_devices()``, this only requires *read* access, which is
-    what a SupplementaryGroups=input service process actually has.
-    """
-    infos = _devices_from_proc()
-    known = {info.path for info in infos}
-    for path in sorted(str(p) for p in Path("/dev/input").glob("event*")):
-        if path in known:
-            continue
-        known.add(path)
-        infos.append(_DeviceInfo(path=path, name="", phys=""))
-    return [info for info in infos if _is_readable(info.path)]
-
-
-def _devices_from_proc() -> list[_DeviceInfo]:
-    try:
-        text = Path("/proc/bus/input/devices").read_text(errors="replace")
-    except OSError:
-        return []
-
-    # /proc/bus/input/devices uses a different indentation per kernel version;
-    # normalize the leading whitespace before matching.
-    text = re.sub(r"^ +", "", text, flags=re.MULTILINE)
-
-    infos: list[_DeviceInfo] = []
-    name = ""
-    phys = ""
-    for line in text.splitlines():
-        name_match = _match_group(_PROCDEV_NAME_RE, line)
-        if name_match is not None:
-            name = name_match
-            continue
-        phys_match = _match_group(_PROCDEV_PHYS_RE, line)
-        if phys_match is not None:
-            phys = phys_match
-            continue
-        handlers = _match_group(_PROCDEV_HANDLERS_RE, line)
-        if handlers is None:
-            continue
-        for node in _EVENT_NODE_RE.findall(handlers):
-            infos.append(_DeviceInfo(path=f"/dev/input/{node}", name=name, phys=phys))
-    return infos
 
 
 def _match_group(pattern: re.Pattern[str], line: str) -> str | None:
@@ -141,13 +122,126 @@ def _match_group(pattern: re.Pattern[str], line: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
+def _devices_from_proc() -> list[_DeviceInfo]:
+    try:
+        text = PROCDEV_PATH.read_text(errors="replace")
+    except OSError:
+        return []
+
+    # The indentation of /proc/bus/input/devices differs between kernel
+    # versions; normalize the leading whitespace before matching.
+    text = re.sub(r"^ +", "", text, flags=re.MULTILINE)
+
+    infos: list[_DeviceInfo] = []
+    name = ""
+    phys = ""
+    uniq = ""
+    for line in text.splitlines():
+        name_match = _match_group(_PROCDEV_NAME_RE, line)
+        if name_match is not None:
+            # Start of a new block: reset the identity fields.
+            name, phys, uniq = name_match, "", ""
+            continue
+        phys_match = _match_group(_PROCDEV_PHYS_RE, line)
+        if phys_match is not None:
+            phys = phys_match
+            continue
+        uniq_match = _match_group(_PROCDEV_UNIQ_RE, line)
+        if uniq_match is not None:
+            uniq = uniq_match
+            continue
+        handlers = _match_group(_PROCDEV_HANDLERS_RE, line)
+        if handlers is None:
+            continue
+        for node in _EVENT_NODE_RE.findall(handlers):
+            infos.append(
+                _DeviceInfo(path=f"{INPUT_DIR}/{node}", name=name, phys=phys, uniq=uniq)
+            )
+    return infos
+
+
+def _readable_input_devices() -> list[_DeviceInfo]:
+    """List readable /dev/input/event* nodes with their identity from /proc.
+
+    Unlike ``evdev.list_devices()`` (which defaults to ``writable=True`` and
+    therefore returns nothing for a non-root process in the ``input`` group),
+    this only requires *read* access.
+    """
+    infos = _devices_from_proc()
+    known = {info.path for info in infos}
+    for path in sorted(str(p) for p in INPUT_DIR.glob("event*")):
+        if path in known:
+            continue
+        known.add(path)
+        infos.append(_DeviceInfo(path=path, name="", phys="", uniq=""))
+    return [info for info in infos if _is_readable(info.path)]
+
+
+@final
+class _OpenDevice:
+    """An open evdev device plus the identity it was opened for.
+
+    A plain class rather than a dataclass: basedpyright fails to resolve the
+    generic ``evdev.InputDevice[str]`` in a class-body annotation, but resolves
+    it fine in a parameter annotation, and identity semantics are wanted here
+    anyway.
+    """
+
+    def __init__(self, device: evdev.InputDevice[str], info: _DeviceInfo) -> None:
+        self.device = device
+        self.info = info
+        self.task: asyncio.Task[None] | None = None
+        self.grabbed = False
+        self.failed = False
+
+
+def _is_alive(node: _OpenDevice) -> bool:
+    """Whether the open fd still belongs to the node at its path.
+
+    A suspend or an unplug invalidates the fd even when the path comes back
+    later, so compare the device numbers *and* the inode of the open fd with
+    the current node.
+    """
+    try:
+        current = os.stat(str(node.device.path))
+        opened = os.fstat(node.device.fd)
+    except (OSError, ValueError, TypeError):
+        return False
+    return current.st_rdev == opened.st_rdev and current.st_ino == opened.st_ino
+
+
+class _UdevMonitor(Protocol):
+    """The sliver of ``pyudev.Monitor`` that this daemon uses."""
+
+    def fileno(self) -> int: ...
+
+    def poll(self, timeout: float | None = None) -> object | None: ...
+
+
+def _open_udev_monitor() -> _UdevMonitor | None:
+    """Subscribe to udev 'input' events, or return None when unavailable."""
+    if pyudev is None:
+        return None
+    try:
+        monitor = pyudev.Monitor.from_netlink(pyudev.Context())
+        monitor.filter_by("input")
+    except Exception as e:  # noqa: BLE001 — udev is optional at runtime
+        _ = sys.stderr.write(f"cannot subscribe to udev events: {e}\n")
+        return None
+    return cast("_UdevMonitor", monitor)
+
+
+def _drain_udev(monitor: _UdevMonitor) -> None:
+    """Consume every queued event so the monitor stops reporting readable."""
+    while monitor.poll(timeout=0) is not None:
+        pass
+
+
 @final
 class InputDaemon:
     def __init__(self, socket_path: Path) -> None:
         self._socket_path = socket_path
-        self._devices: list[evdev.InputDevice[str]] = []
-        self._grabbed: list[evdev.InputDevice[str]] = []
-        self._read_tasks: list[asyncio.Task[None]] = []
+        self._devices: list[_OpenDevice] = []
         self._shutdown_event = asyncio.Event()
         self._shutdown_flag = False
         self._server: asyncio.AbstractServer | None = None
@@ -156,8 +250,9 @@ class InputDaemon:
         self._press_count: int = 0
         self._mode: str = MODE_DESKTOP
         self._lock = asyncio.Lock()
-        self._rescan_task: asyncio.Task[None] | None = None
-        self._rescan_queue: asyncio.Queue[None] = asyncio.Queue()
+        self._watch_task: asyncio.Task[None] | None = None
+        self._reconcile_task: asyncio.Task[None] | None = None
+        self._no_devices_warned = False
 
     # ------------------------------------------------------------------ setup
 
@@ -168,7 +263,8 @@ class InputDaemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._shutdown)
 
-        self._open_devices()
+        await self._reconcile_devices()
+        self._watch_task = asyncio.create_task(self._watch_devices())
 
         await self._unlink_socket()
         self._server = await asyncio.start_unix_server(
@@ -182,28 +278,40 @@ class InputDaemon:
         finally:
             await self._cleanup()
 
-    def _open_devices(self) -> None:
-        """Open every readable device; grabbing happens only in gamescope mode.
+    # ------------------------------------------------------------- device set
 
-        ``evdev.list_devices()`` defaults to ``writable=True`` and therefore
-        only returns devices that are both readable *and* writable.  Input
-        devices are ``root:input 0660``, so a non-owner process fails the
-        write access check and enumerates nothing.  Scan for readability
-        instead and derive names/phys from /proc.
+    async def _reconcile_devices(self) -> None:
+        """Open devices that appeared and drop those that went away.
+
+        Called on udev events, on every mode change and after a read error, so
+        it must be safe to call at any time.
         """
-        for info in _readable_input_devices():
-            if info.path in self._open_paths():
+        for node in list(self._devices):
+            if not _is_alive(node):
+                self._drop_device(node)
+
+        wanted = _readable_input_devices()
+        have: Counter[tuple[str, str, str]] = Counter(
+            _fingerprint(node.info) for node in self._devices
+        )
+        for info in wanted:
+            fingerprint = _fingerprint(info)
+            if have[fingerprint] > 0:
+                have[fingerprint] -= 1
                 continue
             self._open_one(info)
 
-        if not self._devices:
+        if self._devices:
+            self._no_devices_warned = False
+        elif not self._no_devices_warned:
+            self._no_devices_warned = True
             _ = sys.stderr.write(
-                "No input devices could be opened. Is the daemon running with "
+                "No input devices are readable. Is the daemon running with "
                 + "access to /dev/input (SupplementaryGroups=input)?\n"
             )
 
-    def _open_paths(self) -> set[str]:
-        return {str(device.path) for device in self._devices}
+        if self._mode == MODE_GAMESCOPE:
+            self._grab_power_button()
 
     def _open_one(self, info: _DeviceInfo) -> None:
         try:
@@ -211,62 +319,108 @@ class InputDaemon:
         except OSError as e:
             _ = sys.stderr.write(f"cannot open {info.path}: {e}\n")
             return
-        self._devices.append(device)
-        self._read_tasks.append(asyncio.create_task(self._read_device(device)))
+        node = _OpenDevice(device=device, info=info)
+        self._devices.append(node)
+        task = asyncio.create_task(self._read_device(node))
+        node.task = task
+        # Cleanup rides on the task, not on the coroutine: a task cancelled
+        # before it ever ran never executes its own finally block.
+        task.add_done_callback(partial(self._on_reader_done, node))
 
-    def _close_device(self, device: evdev.InputDevice[str]) -> None:
-        if device in self._grabbed:
-            self._grabbed.remove(device)
-            try:
-                device.ungrab()
-            except OSError:
-                pass
-        if device in self._devices:
-            self._devices.remove(device)
-        try:
-            device.close()
-        except OSError:
-            pass
+    def _on_reader_done(self, node: _OpenDevice, _task: asyncio.Task[None]) -> None:
+        """Release a device whose reader finished, for any reason."""
+        self._forget(node)
+        if node.failed and not self._shutdown_flag:
+            # Unplug or suspend: the device is gone, but the node may already
+            # be back, so look for it again.
+            _ = sys.stderr.write(f"input device went away: {node.device.path}\n")
+            self._schedule_reconcile()
 
-    async def _drop_device(self, device: evdev.InputDevice[str]) -> None:
-        """Close a dead device and rescan for its replacement."""
-        self._close_device(device)
-        await self._request_rescan()
+    def _drop_device(self, node: _OpenDevice) -> None:
+        """Stop reading a device; the read task closes it in its teardown."""
+        # Drop it from the active set immediately: the read task's teardown
+        # only runs on the next loop turn, and until then a device that has
+        # already come back must not be considered "still open".
+        if node in self._devices:
+            self._devices.remove(node)
+        task = node.task
+        if task is None or task is asyncio.current_task() or task.done():
+            self._forget(node)
+            return
+        _ = task.cancel()
 
-    async def _request_rescan(self) -> None:
+    def _forget(self, node: _OpenDevice) -> None:
+        """Remove a device from the active set, release and close it."""
+        if node in self._devices:
+            self._devices.remove(node)
+        if node.grabbed:
+            with contextlib.suppress(OSError):
+                node.device.ungrab()
+            node.grabbed = False
+        node.task = None
+        with contextlib.suppress(OSError):
+            node.device.close()
+
+    def _schedule_reconcile(self) -> None:
+        """Re-open devices shortly, coalescing bursts of events."""
         if self._shutdown_flag:
             return
-        if self._rescan_task is None or self._rescan_task.done():
-            self._rescan_task = asyncio.create_task(self._rescan_loop())
+        if self._reconcile_task is None or self._reconcile_task.done():
+            self._reconcile_task = asyncio.create_task(self._reconcile_soon())
 
-    async def _rescan_loop(self) -> None:
-        """Re-open devices that appeared after startup (delay is a udev debounce)."""
+    async def _reconcile_soon(self) -> None:
         try:
-            while not self._shutdown_flag:
-                try:
-                    _ = await asyncio.wait_for(
-                        self._rescan_queue.get(), timeout=RESCAN_DELAY_SECONDS
-                    )
-                except TimeoutError:
-                    pass
-                else:
-                    continue
-                break
-
-            if self._shutdown_flag:
-                return
-
-            known = self._open_paths()
-            for info in _readable_input_devices():
-                if info.path in known:
-                    continue
-                self._open_one(info)
-            if self._mode == MODE_GAMESCOPE:
-                self._grab_power_button()
+            await asyncio.sleep(UDEV_DEBOUNCE_SECONDS)
+            await self._reconcile_devices()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — never let a rescan kill the daemon
-            _ = sys.stderr.write(f"rescan failed: {e}\n")
+            _ = sys.stderr.write(f"device rescan failed: {e}\n")
+
+    async def _watch_devices(self) -> None:
+        """Reconcile on udev events, with a periodic safety rescan."""
+        monitor = _open_udev_monitor()
+        loop = asyncio.get_running_loop()
+        wakeup = asyncio.Event()
+        fileno = -1
+        if monitor is not None:
+            fileno = int(monitor.fileno())
+            loop.add_reader(fileno, wakeup.set)
+            interval = SAFETY_INTERVAL_SECONDS
+        else:
+            interval = POLL_INTERVAL_SECONDS
+            _ = sys.stderr.write(
+                "pyudev is unavailable; polling /dev/input every "
+                + f"{POLL_INTERVAL_SECONDS:g}s instead of using udev events\n"
+            )
+
+        try:
+            while not self._shutdown_flag:
+                try:
+                    if monitor is None:
+                        await asyncio.sleep(interval)
+                    else:
+                        try:
+                            _ = await asyncio.wait_for(wakeup.wait(), timeout=interval)
+                        except TimeoutError:
+                            pass
+                        else:
+                            wakeup.clear()
+                            _drain_udev(monitor)
+                            # A single device produces several events; wait for
+                            # the burst to settle before reading /dev/input.
+                            await asyncio.sleep(UDEV_DEBOUNCE_SECONDS)
+                    if self._shutdown_flag:
+                        break
+                    await self._reconcile_devices()
+                except Exception as e:  # noqa: BLE001
+                    # Never let one bad event stop the watcher: without it the
+                    # daemon would not recover from unplug or suspend again.
+                    _ = sys.stderr.write(f"device watcher iteration failed: {e}\n")
+                    await asyncio.sleep(interval)
+        finally:
+            if fileno >= 0:
+                _ = loop.remove_reader(fileno)
 
     async def _unlink_socket(self) -> None:
         try:
@@ -311,7 +465,7 @@ class InputDaemon:
             if command == "status":
                 return self._mode
             if command == "rescan":
-                await self._rescan_devices()
+                await self._reconcile_devices()
                 return f"rescanned: {len(self._devices)} devices"
             if command == "stop":
                 self._shutdown()
@@ -321,7 +475,7 @@ class InputDaemon:
     async def _set_mode(self, mode: str) -> None:
         if mode == self._mode:
             return
-        await self._rescan_devices()
+        await self._reconcile_devices()
         if mode == MODE_GAMESCOPE:
             self._grab_power_button()
             self._mode = MODE_GAMESCOPE
@@ -330,34 +484,26 @@ class InputDaemon:
             self._reset_press_state()
             self._mode = MODE_DESKTOP
 
-    async def _rescan_devices(self) -> None:
-        """Pick up devices that were not readable when the daemon started."""
-        known = self._open_paths()
-        for info in _readable_input_devices():
-            if info.path not in known:
-                self._open_one(info)
-        if not self._devices:
-            _ = sys.stderr.write("device rescan opened no input devices\n")
-
     def _grab_power_button(self) -> None:
-        for device in self._devices:
-            if device in self._grabbed:
+        for node in self._devices:
+            if node.grabbed:
                 continue
-            if self._is_power_button(device):
-                try:
-                    device.grab()
-                except OSError as e:
-                    _ = sys.stderr.write(f"cannot grab {device.path}: {e}\n")
-                    continue
-                self._grabbed.append(device)
+            if not self._is_power_button(node.device):
+                continue
+            try:
+                node.device.grab()
+            except OSError as e:
+                _ = sys.stderr.write(f"cannot grab {node.device.path}: {e}\n")
+                continue
+            node.grabbed = True
 
     def _ungrab_all(self) -> None:
-        for device in self._grabbed:
-            try:
-                device.ungrab()
-            except OSError:
-                pass
-        self._grabbed.clear()
+        for node in self._devices:
+            if not node.grabbed:
+                continue
+            with contextlib.suppress(OSError):
+                node.device.ungrab()
+            node.grabbed = False
 
     def _reset_press_state(self) -> None:
         if self._pending_single_task is not None:
@@ -377,41 +523,32 @@ class InputDaemon:
         self._shutdown_flag = True
         self._reset_press_state()
 
-        rescan_task = self._rescan_task
-        self._rescan_task = None
-        if rescan_task is not None and not rescan_task.done():
-            _ = rescan_task.cancel()
-            try:
-                await rescan_task
-            except asyncio.CancelledError:
-                pass
+        background = [task for task in (self._watch_task, self._reconcile_task) if task]
+        for task in background:
+            _ = task.cancel()
+        for task in background:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._watch_task = None
+        self._reconcile_task = None
 
         if self._server is not None:
             self._server.close()
-            try:
+            with contextlib.suppress(OSError):
                 await self._server.wait_closed()
-            except OSError:
-                pass
 
-        self._ungrab_all()
-
-        for task in self._read_tasks:
+        # Cancel the readers first: while a read task runs, evdev owns the fd
+        # and unregisters it from the event loop in its own teardown.
+        readers = [node.task for node in self._devices if node.task is not None]
+        for task in readers:
             if not task.done():
                 _ = task.cancel()
-        for task in self._read_tasks:
-            try:
+        for task in readers:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
-        self._read_tasks.clear()
-
-        for device in self._devices:
-            try:
-                device.close()
-            except OSError:
-                pass
+        for node in list(self._devices):
+            self._forget(node)
         self._devices.clear()
-        self._grabbed.clear()
 
         try:
             self._socket_path.unlink()
@@ -422,8 +559,9 @@ class InputDaemon:
 
     # ----------------------------------------------------------- event loop
 
-    async def _read_device(self, device: evdev.InputDevice[str]) -> None:
-        failed = False
+    async def _read_device(self, node: _OpenDevice) -> None:
+        """Read one device until it dies; the reader task owns the fd."""
+        device = node.device
         try:
             events: AsyncIterator[evdev.InputEvent] = cast(
                 "AsyncIterator[evdev.InputEvent]",
@@ -448,18 +586,12 @@ class InputDaemon:
         except asyncio.CancelledError:
             raise
         except OSError as e:
-            failed = True
+            node.failed = True
             if e.errno != errno.ENODEV:
                 _ = sys.stderr.write(f"evdev error on {device.path}: {e}\n")
         except Exception as e:  # noqa: BLE001 — last-resort guard for evdev reads
-            failed = True
+            node.failed = True
             _ = sys.stderr.write(f"unexpected error on {device.path}: {e}\n")
-
-        if failed and not self._shutdown_flag:
-            path = device.path
-            self._close_device(device)
-            _ = sys.stderr.write(f"reopening input device {path}\n")
-            await self._request_rescan()
 
     @staticmethod
     def _is_power_button(device: evdev.InputDevice[str]) -> bool:

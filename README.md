@@ -56,7 +56,7 @@ tests/         manual verification scripts (not installed)
 
 ## Requirements
 
-- Python 3 and `python-evdev`
+- Python 3, `python-evdev` and `python-pyudev`
 - PipeWire (`wpctl`) for volume control
 - `uwsm` (used as the desktop session manager)
 - `gamescope` and Steam (Game Mode)
@@ -179,13 +179,25 @@ Daemon commands: `gamescope`, `desktop`, `status`, `rescan`, `stop`.
 
 `rescan` re-reads `/dev/input` and opens any device that was not readable at
 startup (a keyboard plugged in later, or one whose `systemd-logind` ACL
-appeared after the daemon started). It runs automatically when the mode
-changes and after a device read error, so it rarely needs to be issued by
-hand.
+appeared after the daemon started).
+
+The daemon also watches udev continuously, so it re-opens devices by itself on
+hot-plug, on mode changes and after an unplug or **suspend/resume**: devices
+are matched by identity (`name`/`phys`/`uniq` from
+`/proc/bus/input/devices`), never by their `eventN` node, because those numbers
+change when a device is re-registered. Without `python-pyudev` the daemon falls
+back to polling `/dev/input` every two seconds.
 
 ### Diagnosing "the volume keys do nothing"
 
-Run the check as the user the service runs as (or as root):
+Is the daemon even in the right mode? In `desktop` mode it deliberately ignores
+every key, so the compositor keeps handling them:
+
+```sh
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/gamescope-input-daemon/'+'$(id -un)'+'/gamescope-input-daemon.sock'); s.sendall(b'status'); print(s.recv(100).decode().strip())"
+```
+
+Then check that its scanner can read the devices at all:
 
 ```sh
 sudo tests/manual-check.sh
@@ -195,6 +207,15 @@ It prints how many input devices the daemon's scanner can actually read. A
 non-root user without the `input` group prints `0` — that is expected. If it
 prints `0` for the service account too, the service is missing
 `SupplementaryGroups=input`.
+
+### Tests
+
+```sh
+/usr/bin/python3 tests/test_reconcile.py
+```
+
+Unit-tests the device reconciliation (open, drop, re-open under a new node)
+with fake devices; it never touches real hardware.
 
 ## Logs
 
@@ -261,17 +282,32 @@ revisited:
   `writable=True` and only returns nodes that are both readable *and*
   writable. `/dev/input/event*` is `root:input 0660`, so a process that is in
   the `input` group but is not root fails the write check and enumerates
-  **zero** devices — the daemon then runs silently blind (the Power Button
-  appears to work only until the ACL set by `systemd-logind` is dropped, e.g.
-  after switching sessions or a USB re-plug). The daemon therefore scans for
-  readable nodes itself (`os.open(..., O_RDONLY | O_NONBLOCK)`) and takes
-  names/phys from `/proc/bus/input/devices`. Do not go back to
+  **zero** devices — the daemon then runs silently blind. The daemon therefore
+  scans for readable nodes itself (`os.open(..., O_RDONLY | O_NONBLOCK)`) and
+  takes names/phys/uniq from `/proc/bus/input/devices`. Do not go back to
   `evdev.list_devices()`.
-- **Hotplug.** Devices that appear later (or whose ACL was set after the daemon
-  started) are picked up by `rescan`, which runs automatically on `gamescope`/
-  `desktop` mode changes, after a read error, and on demand via the control
-  socket. There is no udev monitor; the re-scan is a debounced snapshot, which
-  is enough because the daemon only needs devices at the moment a key arrives.
+- **`evdev.InputDevice(fd)` re-opens with `O_RDWR`.** Passing a file
+  descriptor is not a way around the write-access requirement: evdev re-opens
+  the number with `O_RDWR` (`TypeError: open: path should be string, ...` on
+  newer versions, or `EACCES`). Pass the path so evdev can fall back to
+  `O_RDONLY`.
+- **Suspend/resume kills the fds.** The wireless keyboards (`AULA-F75`,
+  `MCHOSE G7`) disappear from `/dev/input` during suspend, which invalidates
+  the open descriptors; a one-shot "reopen on read error" is not enough,
+  because it runs before the devices are back and is never retried. This is
+  why the daemon keeps a persistent watcher and reconciles device sets instead
+  of trying to reopen a single path.
+- **Identity, not node numbers.** After a resume a device can come back as a
+  different `eventN`, so the reconcile matches on
+  `name`/`phys`/`uniq` with a per-fingerprint count (two identical keyboards
+  share a fingerprint).
+- **A cancelled task that never ran has no `finally`.** Device cleanup is
+  attached to the reader task via `add_done_callback`, not to the coroutine's
+  `finally`: a task cancelled before its first step never executes the
+  coroutine body, so a `finally`-based close would leak the fd.
+- **basedpyright cannot resolve `evdev.InputDevice[str]` in class-body
+  annotations.** It resolves fine in a function parameter, so `_OpenDevice`
+  takes the device through `__init__` parameters instead of a dataclass field.
 
 ## License
 

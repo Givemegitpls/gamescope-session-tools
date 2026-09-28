@@ -1,13 +1,13 @@
 # Maintainer: Givemegitpls <veryangrybarmaley@gmail.com>
 
 pkgname=gamescope-session-tools
-pkgver=1.0.1
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Gamescope session integration: media/power button daemon, session switcher and SteamOS stubs"
 arch=('any')
 url="https://github.com/Givemegitpls/gamescope-session-tools"
 license=('MIT')
-depends=('python' 'python-evdev' 'pipewire')
+depends=('python' 'python-evdev' 'python-pyudev' 'pipewire')
 optdepends=(
     'steam: power button forwards to the Steam power menu'
     'gamescope: the session this package integrates with'
