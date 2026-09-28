@@ -50,6 +50,7 @@ LICENSE        MIT
 README.md      this file
 .gitignore     build artifacts, editor files
 src/           scripts and the systemd unit installed by the package
+tests/         manual verification scripts (not installed)
 .opencode/     agent notes for this repository
 ```
 
@@ -174,7 +175,26 @@ echo status | socat - UNIX-CONNECT:/run/gamescope-input-daemon/$USER/gamescope-i
 echo desktop | socat - UNIX-CONNECT:/run/gamescope-input-daemon/$USER/gamescope-input-daemon.sock
 ```
 
-Daemon commands: `gamescope`, `desktop`, `status`, `stop`.
+Daemon commands: `gamescope`, `desktop`, `status`, `rescan`, `stop`.
+
+`rescan` re-reads `/dev/input` and opens any device that was not readable at
+startup (a keyboard plugged in later, or one whose `systemd-logind` ACL
+appeared after the daemon started). It runs automatically when the mode
+changes and after a device read error, so it rarely needs to be issued by
+hand.
+
+### Diagnosing "the volume keys do nothing"
+
+Run the check as the user the service runs as (or as root):
+
+```sh
+sudo tests/manual-check.sh
+```
+
+It prints how many input devices the daemon's scanner can actually read. A
+non-root user without the `input` group prints `0` — that is expected. If it
+prints `0` for the service account too, the service is missing
+`SupplementaryGroups=input`.
 
 ## Logs
 
@@ -237,6 +257,21 @@ revisited:
 - **Socket layout.** One runtime directory per user
   (`RuntimeDirectory=gamescope-input-daemon/%i`) keeps instances isolated;
   `%i` in `RuntimeDirectory` is accepted by systemd.
+- **`evdev.list_devices()` needs write access.** It defaults to
+  `writable=True` and only returns nodes that are both readable *and*
+  writable. `/dev/input/event*` is `root:input 0660`, so a process that is in
+  the `input` group but is not root fails the write check and enumerates
+  **zero** devices — the daemon then runs silently blind (the Power Button
+  appears to work only until the ACL set by `systemd-logind` is dropped, e.g.
+  after switching sessions or a USB re-plug). The daemon therefore scans for
+  readable nodes itself (`os.open(..., O_RDONLY | O_NONBLOCK)`) and takes
+  names/phys from `/proc/bus/input/devices`. Do not go back to
+  `evdev.list_devices()`.
+- **Hotplug.** Devices that appear later (or whose ACL was set after the daemon
+  started) are picked up by `rescan`, which runs automatically on `gamescope`/
+  `desktop` mode changes, after a read error, and on demand via the control
+  socket. There is no udev monitor; the re-scan is a debounced snapshot, which
+  is enough because the daemon only needs devices at the moment a key arrives.
 
 ## License
 

@@ -1,7 +1,7 @@
 # Maintainer: Givemegitpls <veryangrybarmaley@gmail.com>
 
 pkgname=gamescope-session-tools
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="Gamescope session integration: media/power button daemon, session switcher and SteamOS stubs"
 arch=('any')
